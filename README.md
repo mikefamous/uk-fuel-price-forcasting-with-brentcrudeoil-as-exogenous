@@ -38,3 +38,322 @@ fuel-price-forecasting-brent-as-exogenous/
 ├── visuals/         # (optional) figures/plots for README
 └── README.md
 ```
+---
+title: "Fuel Price & Demand Forecasting with Brent as Exogenous Variable"
+author: "Your Name"
+date: "`r format(Sys.Date(), '%d %B %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+---
+
+# Overview
+
+This report performs weekly time-series preparation and forecasting for **fuel metrics** (price, demand, sales), incorporating **Brent crude price** as an exogenous regressor.  
+It follows a workflow: data import → cleaning & gap-filling → exploratory plots → normality checks → decomposition → stationarity diagnostics → model fitting (ARIMAX, TSLM, seasonal ARIMA, STL + ARIMA) → accuracy comparison → future forecasting.
+
+> Replace the CSV path or pre-load `fuel_data1` as needed.
+
+# Setup
+
+```{r setup, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(lubridate)
+library(tsibble)
+library(feasts)
+library(fable)
+library(forecast)
+library(fabletools)
+library(tseries)
+library(zoo)
+library(ggpubr)
+library(nortest)
+library(patchwork)
+```
+
+# 1. Data Loading
+
+```{r load-data}
+# Read your merged dataset (edit path as needed)
+fuel_data1 <- read_csv("merged_dataset.csv")
+
+# Quick preview
+head(fuel_data1)
+tail(fuel_data1)
+dim(fuel_data1)
+```
+
+# 2. Trim Last 9 Rows (If Needed)
+
+```{r trim-data}
+# Remove the last 9 rows as per your script
+fuel_data <- fuel_data1 %>% 
+  slice(1:(n() - 9))
+
+# Verify
+tail(fuel_data)
+dim(fuel_data)
+```
+
+# 3. Convert to Weekly Tsibble & Fill Missing Values
+
+```{r to-tsibble}
+# Ensure the date column exists and is named Week_Ending (edit if your column differs)
+stopifnot("Week_Ending" %in% names(fuel_data))
+
+fuel_ts <- fuel_data %>%
+  mutate(
+    Week_Ending = ymd(Week_Ending)
+  ) %>%
+  distinct(Week_Ending, .keep_all = TRUE) %>%
+  as_tsibble(index = Week_Ending) %>%
+  fill_gaps() %>%
+  mutate(
+    across(
+      c(Avg_Fuel_Price, Est_Demand, Avg_Fuel_Sales, Brent_Price),
+      ~ na.approx(.x, na.rm = FALSE, rule = 2)
+    )
+  )
+
+glimpse(fuel_ts)
+sum(is.na(fuel_ts))
+```
+
+# 4. Outlier Handling (Fuel Price Examples)
+
+```{r outliers}
+fuel_ts <- fuel_ts %>%
+  mutate(
+    Avg_Fuel_Price = ifelse(Avg_Fuel_Price > 500, median(Avg_Fuel_Price, na.rm = TRUE), Avg_Fuel_Price),
+    Avg_Fuel_Price = ifelse(Avg_Fuel_Price < 1,   median(Avg_Fuel_Price, na.rm = TRUE), Avg_Fuel_Price)
+  )
+```
+
+# 5. Boxplots for Numeric Variables
+
+```{r boxplots, fig.width=8, fig.height=6}
+# Select numeric columns only
+num_cols <- names(fuel_ts)[map_lgl(fuel_ts, is.numeric)]
+numeric_data <- as.data.frame(fuel_ts)[, num_cols, drop = FALSE]
+
+# Base R boxplots in a grid
+par(mfrow = c(2, 2))
+for (col in names(numeric_data)) {
+  boxplot(numeric_data[[col]],
+          main = col,
+          col = "lightblue",
+          outpch = 19,
+          outcol = "red")
+}
+par(mfrow = c(1, 1))
+```
+
+# 6. Normality Checks (Example: `Est_Demand`)
+
+```{r normality}
+est_demand_clean <- na.omit(fuel_ts$Est_Demand)
+
+# Shapiro-Wilk (n <= 5000 recommended)
+shapiro_test_result <- tryCatch(shapiro.test(est_demand_clean), error = function(e) e)
+shapiro_test_result
+
+# Anderson-Darling
+ad_test_result <- ad.test(est_demand_clean)
+ad_test_result
+
+# Histogram + density
+hist(est_demand_clean,
+     main = "Histogram of Est_Demand",
+     xlab = "Est_Demand",
+     col = "lightblue",
+     probability = TRUE,
+     border = "black")
+lines(density(est_demand_clean), lwd = 2)
+```
+
+# 7. Exploratory Time-Series Plots
+
+```{r ts-plots, fig.width=10, fig.height=7}
+p1 <- autoplot(fuel_ts, Avg_Fuel_Price) + ggtitle("Average Fuel Price Over Time")
+p2 <- autoplot(fuel_ts, Est_Demand) + ggtitle("Estimated Demand Over Time")
+p3 <- autoplot(fuel_ts, Avg_Fuel_Sales) + ggtitle("Average Fuel Sales Over Time")
+p4 <- autoplot(fuel_ts, Brent_Price) + ggtitle("Brent Price Over Time")
+
+(p1 + p2) / (p3 + p4)
+```
+
+# 8. Decomposition & Seasonality (Est_Demand)
+
+```{r decomposition}
+decomp <- fuel_ts %>%
+  model(STL(Est_Demand ~ trend(window = 13) + season(window = "periodic"))) %>%
+  components()
+
+autoplot(decomp) + ggtitle("STL Decomposition of Est_Demand")
+
+gg_season(fuel_ts, Est_Demand, period = "year") + ggtitle("Seasonality: Est_Demand")
+```
+
+# 9. Stationarity Tests & Differencing
+
+```{r stationarity}
+adf.test(na.omit(fuel_ts$Est_Demand))
+kpss.test(na.omit(fuel_ts$Est_Demand))
+
+fuel_ts <- fuel_ts %>%
+  mutate(diff_est_demand = difference(Est_Demand))
+
+adf.test(na.omit(fuel_ts$diff_est_demand))
+
+acf(na.omit(fuel_ts$diff_est_demand), main = "ACF of Differenced Est_Demand")
+pacf(na.omit(fuel_ts$diff_est_demand), main = "PACF of Differenced Est_Demand")
+```
+
+# 10. Train/Test Split
+
+```{r split}
+train <- fuel_ts %>% filter(Week_Ending < ymd("2024-01-01"))
+test  <- fuel_ts %>% filter(Week_Ending >= ymd("2024-01-01"))
+
+dim(train); dim(test)
+```
+
+# 11. ARIMAX (Est_Demand ~ Brent_Price)
+
+```{r arimax-model}
+arimax_model <- train %>%
+  model(
+    arimax = ARIMA(Est_Demand ~ Brent_Price + pdq(1,1,1) + PDQ(0,0,0))
+  )
+
+report(arimax_model)
+```
+
+# 12. Forecast & Visualize (ARIMAX)
+
+```{r arimax-forecast, fig.width=9, fig.height=5}
+arimax_fc <- arimax_model %>% forecast(new_data = test)
+
+autoplot(arimax_fc, fuel_ts) +
+  ggtitle("ARIMAX Forecast vs Actual (Est_Demand)") +
+  ylab("Estimated Demand")
+```
+
+# 13. Residual Diagnostics (ARIMAX)
+
+```{r arimax-residuals, fig.width=10, fig.height=7}
+arimax_aug <- augment(arimax_model)  # fitted + residuals on training period
+
+hist_plot <- arimax_aug %>%
+  ggplot(aes(x = .resid)) +
+  geom_histogram(aes(y = ..density..), bins = 30, fill = "lightblue", color = "black") +
+  geom_density() +
+  labs(title = "Residual Distribution (ARIMAX)") +
+  theme_minimal()
+
+time_plot <- arimax_aug %>%
+  ggplot(aes(x = Week_Ending, y = .resid)) +
+  geom_line() +
+  geom_hline(yintercept = 0, color = "red") +
+  labs(title = "Residuals Over Time (ARIMAX)") +
+  theme_minimal()
+
+acf_plot <- ggAcf(na.omit(arimax_aug$.resid)) + labs(title = "ACF of Residuals (ARIMAX)")
+qq_plot <- ggplot(arimax_aug, aes(sample = .resid)) + stat_qq() + stat_qq_line() + theme_minimal() +
+  labs(title = "QQ Plot (ARIMAX)")
+
+(hist_plot + time_plot) / (acf_plot + qq_plot)
+```
+
+# 14. Multiple Models & Accuracy Comparison (Est_Demand)
+
+```{r multi-models}
+# Keep the weekly Date index; fable can handle explicit weekly frequency inferred from dates
+models <- train %>%
+  model(
+    arimax    = ARIMA(Est_Demand ~ Brent_Price),                                # Let ARIMA auto-select orders
+    tslm_x    = TSLM(Est_Demand ~ trend() + season() + Brent_Price),           # Trend/season + exog
+    sarimax   = ARIMA(Est_Demand ~ Brent_Price + pdq(1,1,1) + PDQ(1,0,1)),     # Explicit seasonal structure
+    stl_arima = decomposition_model(STL(Est_Demand), ARIMA(season_adjust ~ Brent_Price))
+  )
+
+# In-sample accuracy
+accuracy_train <- models %>% accuracy()
+accuracy_train %>% arrange(RMSE)
+
+# Out-of-sample accuracy on the test period
+fc_all <- models %>% forecast(new_data = test)
+accuracy_test <- accuracy(fc_all, test) %>% arrange(RMSE)
+accuracy_test
+```
+
+# 15. Residual Checks per Model
+
+```{r residuals-by-model, fig.width=10, fig.height=8}
+models %>% 
+  augment() %>%
+  ggplot(aes(x = Week_Ending, y = .resid)) +
+  geom_line() +
+  geom_hline(yintercept = 0, color = "red") +
+  facet_wrap(~.model, ncol = 1, scales = "free_y") +
+  labs(title = "Residuals Over Time by Model") +
+  theme_minimal()
+```
+
+# 16. Model Selection & Final 12-Week Forecast (Avg_Fuel_Price Example)
+
+```{r final-forecast, fig.width=9, fig.height=5}
+# Fit a suite of models for Avg_Fuel_Price as in your script
+price_models <- train %>%
+  model(
+    ARIMA = ARIMA(Avg_Fuel_Price ~ Brent_Price + pdq(1,1,1) + PDQ(0,0,0)),
+    ETS   = ETS(Avg_Fuel_Price),
+    NAIVE = NAIVE(Avg_Fuel_Price),
+    MEAN  = MEAN(Avg_Fuel_Price),
+    DRIFT = RW(Avg_Fuel_Price ~ drift())
+  )
+
+price_fc_test <- price_models %>% forecast(new_data = test)
+
+# Accuracy table on test period
+price_acc <- accuracy(price_fc_test, test) %>% arrange(RMSE)
+price_acc
+
+# Choose best model by lowest RMSE
+best_name <- price_acc$.model[1]
+best_name
+
+# Refit the best model on the full data for final forecasting
+price_best <- price_models %>% select(!!best_name)
+
+# Create 12-week future exogenous path (simple: mean of recent 12 weeks of Brent)
+future_brent <- mean(tail(na.omit(fuel_ts$Brent_Price), 12))
+future_data <- tibble(
+  Week_Ending = seq(max(fuel_ts$Week_Ending) + weeks(1), by = "week", length.out = 12),
+  Brent_Price = future_brent
+) %>% as_tsibble(index = Week_Ending)
+
+final_price_fc <- price_best %>% forecast(new_data = future_data)
+
+autoplot(fuel_ts, Avg_Fuel_Price) +
+  autolayer(final_price_fc, level = NULL) +
+  labs(title = "12-Week Fuel Price Forecast",
+       subtitle = paste("Best model:", best_name),
+       y = "Average Fuel Price") +
+  theme_minimal()
+```
+
+# 17. Save a PDF with Key Plots
+
+```{r save-pdf, eval=FALSE}
+# Enable to save a concise report locally as PDF
+pdf("fuel_price_forecast_report.pdf", width = 11, height = 8)
+print((p1 + p2) / (p3 + p4))
+print(autoplot(decomp) + ggtitle("STL Decomposition of Est_Demand"))
+print(autoplot(fuel_ts, Avg_Fuel_Price))
+print(autolayer(final_price_fc, level = NULL))
+dev.off()
+```
+
